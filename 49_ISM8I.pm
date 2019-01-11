@@ -4,7 +4,9 @@
 #  49_ISM8I.pm
 # 
 #  (C) 2017 Copyright: Dr. Mugur Dietrich
-#   E-Mail: m punkt i punkt dietrich at gmx punkt de
+#  E-Mail: m punkt i punkt dietrich at gmx punkt de
+#
+#  Projekt Webseite: http://tips-und-mehr.de/wolf-heizanlagen-mit-ism8i-schnittstellenmodul-ueberwachen-und-in-fhem-auswerten/ 
 #
 #  Beschreibung:
 #  Das Schnittstellenmodul ISM8i ist ausschließlich in Verbindung mit Wolf Heizgeräten
@@ -23,6 +25,13 @@
 #  
 #
 #######################################################################################################
+#  10.05.2017 Release Version 1.0
+#  05.06.2017 Update auf Version 1.1 - Bugfixes und Timeout Funktion
+#  31.08.2017 Update auf Version 1.2 - Fixes für Debian Stretch
+#  06.02.2018 Update auf Version 1.2 - Bugsfixes von User Andreas vorgeschlagen
+#  07.02.2018 Update auf Version 1.2 - Weitere Bugsfixes von User Andreas vorgeschlagen
+#######################################################################################################
+
 
 package main;
 
@@ -41,6 +50,9 @@ sub ISM8I_Delete;
 sub ISM8I_Attr;
 sub ISM8I_Set($@);
 sub ISM8I_Read($);
+sub ISM8I_Timeout($);
+sub ItimerStartOrUpdate($);
+sub ItimerKill($);
 sub r_trim;
 sub l_trim;
 sub all_trim;
@@ -87,11 +99,10 @@ sub ISM8I_Define($$) {
   # Default Atribute setzen falls Atribute leeer oder nicht vorhanden:
   if (AttrVal($name, "adress_ip", "empty") eq "empty") { $attr{$name}{"adress_ip"} = "239.7.7.77"; }
   if (AttrVal($name, "adress_port", "empty") eq "empty") { $attr{$name}{"adress_port"} = "35353"; }
-  if (AttrVal($name, "timeout", "empty") eq "empty") { $attr{$name}{"timeout"} = "60"; }
+  if (AttrVal($name, "timeout", "empty") eq "empty") { $attr{$name}{"timeout"} = "300"; }
   if (AttrVal($name, "event-on-change-reading", "empty") eq "empty") { $attr{$name}{"event-on-change-reading"} = ".*"; }
 
   socket_connect($hash);
-
 return undef;
 }
 
@@ -102,7 +113,7 @@ return undef;
 sub ISM8I_Undef($$) {
   my ($hash, $arg) = @_;
   socket_disconnect($hash);
-  
+  ItimerKill($hash);
   readingsSingleUpdate($hash, "state", "closed", 1);
 return undef;
 }
@@ -139,7 +150,7 @@ sub ISM8I_Attr {
   # $name - Gerätename
   # $aName / $aVal sind Attribut-Name und Attribut-Wert
   
-  if ($aName ne "ignoreDatapoints") {
+  if ($aName eq "adress_ip" or $aName eq "adress_port" or $aName eq "timeout") {
 	  $_[3] = all_trim($aVal); # Alle Whitespaces entfernen.
       $aVal = $_[3]; 
   }
@@ -206,11 +217,12 @@ sub ISM8I_Set($@) {
 
 
   if (!defined($sets{$cmd})) {
-  	my @commands = ();
-    foreach my $key (sort keys %sets) {
-      push @commands, $sets{$key} ? $key.":".join(",",$sets{$key}) : $key;
-    }
-    return "Unknown argument $args[1], choose one of " . join(" ", @commands);
+	 return "Unknown argument $args[1], choose one of ".join(" ", sort keys %sets)
+  	#my @commands = ();
+    #foreach my $key (sort keys %sets) {
+    #  push @commands, $sets{$key} ? $key.":".join(",",$sets{$key}) : $key;
+    #}
+    #return "Unknown argument $args[1], choose one of " . join(" ", @commands);
   }
   
   if ($cmd =~ m/^reset/) {
@@ -236,7 +248,6 @@ sub ISM8I_Read($) {
   my ($hash) = @_;
   my $name = $hash->{NAME};
   my $socket = $hash->{TCPDev};
-  my $timeout = AttrVal($name, "timeout", 60);
   my $data;
   my $dp_number;
   my $ignores;
@@ -275,8 +286,9 @@ sub ISM8I_Read($) {
 	      } else {
 	         @dp_fields = split(/\./, $fields[0]);
 		     if (scalar(@dp_fields) >= 3) {
- 	            Log3 ($name, 5, "Checking Ignore: *$dp_number* not in * $ignores * -> ".(" $ignores " !~ m/\Q$dp_number/));
-	            if (" $ignores " !~ m/\Q$dp_number/) { readingsSingleUpdate($hash, "$fields[0]", "$fields[1]", 1); }
+				$dp_number = $dp_fields[1];
+ 	            Log3 ($name, 5, "Checking Ignore: *$dp_number* not in * $ignores * -> ".(" $ignores " !~ m/\Q $dp_number /));
+	            if (" $ignores " !~ m/\Q $dp_number /) { readingsSingleUpdate($hash, "$fields[0]", "$fields[1]", 1); }
 			 }
 		  }
 	   }
@@ -289,14 +301,27 @@ sub ISM8I_Read($) {
 	   $t = ReadingsTimestamp($name, "$fields[0]", TimeNow);
 	   $hash->{HELPER}{LASTUPDATE} = time();
 	   readingsSingleUpdate($hash, "Readings_LastUpdate", "$t", 1);
+	   readingsSingleUpdate($hash, "state", "reception", 1);
+	   ItimerStartOrUpdate($hash);
 
 	   # Anzahl der Readings in den Status:
-	   $t = scalar(keys ($hash->{READINGS})) - 4;
+	   $t = +(keys %{$hash->{READINGS}}) - 4;
 	   readingsSingleUpdate($hash, "Readings_Count", "$t", 1);
 	 }
   }
   
 return undef;
+}
+
+
+###############################################################
+###   Wenn durch den InternalTimer aufgerufen dann Timeout
+###############################################################
+
+sub ISM8I_Timeout($) {
+  my ($hash) = @_;
+  readingsSingleUpdate($hash, "state", "timeout", 1);
+  return undef;  
 }
 
 
@@ -330,6 +355,29 @@ sub dbl_trim { my $s = shift; $s =~ s/\s+/ /g; return $s; }
 sub l_r_dbl_trim { my $s = shift; my $r = l_trim(r_trim(dbl_trim($s))); return $r; }
 
 
+###############################################################
+###   Startet oder updatet den InternalTimer 
+
+sub ItimerStartOrUpdate($) {
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
+  my $tout = AttrVal($name, "timeout", 300);
+  
+  RemoveInternalTimer($hash);
+  InternalTimer(gettimeofday() + $tout, "ISM8I_Timeout", $hash);
+  return undef;  
+}
+
+
+###############################################################
+###   Löscht den InternalTimer 
+
+sub ItimerKill($) {
+  my ($hash) = @_;
+  RemoveInternalTimer($hash);
+  return undef;  
+}
+
 
 ###############################################################
 ### Schreibt alle vorhandenen Readings ins Log (Developement only)
@@ -343,7 +391,7 @@ sub find_reading_on_dp($$) {
 
   my $r;
   
-  foreach $r ( keys $hash->{READINGS} ) { 
+  foreach $r ( keys %{ $hash->{READINGS} } ) { 
     #Log3 ("MyWolf", 5, "Search reading: $find -> $regx -> $r");
 
     if ($r =~ m/$regx/) { 
@@ -376,6 +424,7 @@ sub socket_disconnect($) {
   delete($hash->{FD});
   
   readingsSingleUpdate($hash, "state", "disconnected", 1);
+  ItimerKill($hash);
 
   return undef;
 }
@@ -407,6 +456,7 @@ sub socket_connect($) {
 	 return "ISM8I $name $def_err";
   } else {
   	 readingsSingleUpdate($hash, "state", "initialized", 1);
+	 ItimerStartOrUpdate($hash);
      Log3 ($name, 3, "Socket initialized");
 	 
      $hash->{TCPDev}= $socket;
@@ -431,9 +481,7 @@ sub socket_connect($) {
   <ul>
     Erstellt 2017 von Dr. Mugur Dietrich.
 	<br>
-	Details in meinem Blog <b><a>http://www.tips-und-mehr.de</a></b>
-	<br>
-	Files in meinem Git Hub <b><a>https://github.com/qyqsoft/ISM8I</a></b>
+	Details und Files in meinem Blog <b><a>http://www.tips-und-mehr.de</a></b>
 	<br><br><br>
     <b>Zitat aus der Wolf Montage- und Bedienungsanleitung:</b>
 	<br><br>
@@ -447,14 +495,14 @@ sub socket_connect($) {
 	<br><br>
 	Um das FHEM Modul ISM8I in Betrieb zu nehmen braucht einige Vorarbeit. Das Wolf ISM8i Schnittstellenmodul schickt verschlüsselte Datagramme als TCP Pakete an eine 
 	im Modul-Webinterface vorher eingestellte IP Adresse und erwartet dann eine spezielle verschlüsselte Antwort. Weiterhin ist eine Datenpunkt-spezifische Auswertung 
-	angelehnt an die KNX Variablen Codierung nötig um die Datagramme zu entschlüsseln. Da diese Prozeduren Rechnerzeit beanspruchen und der TCP Verbindungen 'blocking' sind
+	angelehnt an die KNX Variablen Codierung nötig um die Datagramme zu entschlüsseln. Da diese Prozeduren Rechner-Zeit beanspruchen und der TCP Verbindungen 'blocking' sind
 	würde die direkte Integration in ein FHEM Modul Die Ausführung von FHEM verlangsamen oder ganz stoppen. Deswegen habe ich mich entschlossen die ganzen Rechnereien und 
-	und die TCP Komunikation in ein externes Mudul auszulagern, welches vorab installiert werden muss.
+	und die TCP Kommunikation in ein externes Server Modul auszulagern, welches vorab installiert werden muss.
 	<br><br>
 	Das Wolf ISM8i Schnittstellenmodul sollte eine Firmware Version 1.5 oder höher haben. Die Firma Wolf updatet die Firmware kostenlos nach Kontaktaufnahme und Einsendung 
-	des Moduls. Frühere FW Versionen gehen evtl auch, nur kann es sein dass diverse Datagramme eurer Geräte gar nicht erst erzeugt und gesendet werden bzw. falsch sind. Bei 
+	des Moduls. Frühere FW Versionen gehen evtl. auch, nur kann es sein dass diverse Datagramme eurer Geräte gar nicht erst erzeugt und gesendet werden bzw. falsch sind. Bei 
 	der FW Version 1.4 gab es 191, bei der FW Version 1.5 gibt es 210 Datenpunkte und es sind nicht nur welche dazu gekommen, es haben sich auch etliche verändert. Ihr könnt aber 
-	im Configfile meines externen ism8i.pl Moduls angeben welche FW version ihr habt und es werden die entsprechenden Datenpunkte verwendet. 
+	im Configfile meines externen wolf_ism8i.pl Moduls angeben welche FW Version ihr habt und es werden die entsprechenden Datenpunkte verwendet. 
 	Weiterhin sind folgende Perl Module nötig:
 	<br><br>
      - Perl Modul: IO::Socket::Multicast. Auf Debian Systemen mit <code>apt install libio-socket-multicast-perl</code> installieren.
@@ -463,23 +511,23 @@ sub socket_connect($) {
 	<br><br>
 	<b>Umsetzung</b>
 	<br><br>
-	Das externe ism8i.pl Modul schickt die entschlüsselten Datagramme an eine Multicast Gruppe, die das ISM8I FHEM Modul abfängt und als Reading ausgibt.<br>
-	Obwohl das Wolf ISM8i Schnittstellenmodul auch Eingaben verarbeiten kann habe ich mich entschlossen dass das ISM8I FHEM Modul ausschliesslich lesend auf die Schnittstelle 
-    zugreift, da ich bein Testen gelegentlich das Steuermodul unserer Wolf Brennwertheizung in einen Fehlerzustand ("Adaptation kann nicht geladen werden" o.ä.) gebracht habe 
-	und sich die Anlage nur mittels Aus- und Einschalten wieder eingekriegt hat.
+	Das externe wolf_ism8i.pl Modul schickt die entschlüsselten Datagramme an eine Multicast Gruppe, die das ISM8I FHEM Modul abfängt und als Reading ausgibt.<br>
+	Obwohl das Wolf ISM8i Schnittstellenmodul auch Eingaben verarbeiten kann habe ich mich entschlossen dass das ISM8I FHEM Modul ausschließlich lesend auf die Schnittstelle 
+    zugreift, da ich beim Testen gelegentlich das Steuermodul unserer Wolf Anlage in einen Fehlerzustand ("Adaption kann nicht geladen werden" o.ä.) gebracht habe 
+	und sich die Anlage nur mittels Aus- und Einschalten wieder beruhigt hat.
 	<br><br>
-	Die empfangenen Daten sind follgendermaßen aufgebaut:
+	Die empfangenen Daten sind folgendermaßen aufgebaut:
 	<br><br>
-	Es wird ein String empfangen der aus verschiedenen Bestandteilen besteht die mit einem Punkt (.) verbunden sind.<br>
+	Es wird ein Text empfangen der aus verschiedenen Bestandteilen besteht die mit einem Punkt (.) verbunden sind.<br>
 	Das sieht z.B. so aus: <b>Heizgeraet_1_TOB_CGB_2_MGK_2.1.Stoerung</b> oder <b>Mischermodul_1.115.Warmwassertemperatur.C</b>.
 	<br><br>
 	Die Bedeutung der einzelnen Bestandteile ist:<br>
 	<ul>
     <li>Teil 1 : Die Bezeichnung des Gerätes welches die Daten schickt. </li>
     <li>Teil 2 : Die Nummer/ID das Datenpunkts. </li>
-    <li>Teil 3 : Der Bestandteil des Gesrätes welches die Daten schickt. </li>
-    <li>Teil 4 : Die Einheit des übertragenen Wertes. Teil 4 ist optional ung kommt nicht bei allen Datenpnkten vor.<br>
-                 Die Bedeutung der Enheiten lautet: C = °C, proz = %, Pa = Pascal, l_h = Liter/Stunde, m3_h = Kubikmeter/Stunde etc.</li> 
+    <li>Teil 3 : Der Bestandteil des Gerätes welches die Daten schickt. </li>
+    <li>Teil 4 : Die Einheit des übertragenen Wertes. Teil 4 ist optional und kommt nicht bei allen Datenpunkten vor.<br>
+                 Die Bedeutung der Einheiten lautet: C = °C, proz = %, Pa = Pascal, l_h = Liter/Stunde, m3_h = Kubikmeter/Stunde etc.</li> 
     </ul>
 	<br><br>
 	
@@ -499,13 +547,12 @@ sub socket_connect($) {
   <li><b>adress_ip</b>               : Die IP Adresse der Multicast-Gruppe an die das ism8i.pl Modul Daten sendet. </li>
   <li><b>adress_port</b>             : Der Port der Multicast-Gruppe an die das ism8i.pl Modul Daten sendet. </li>
   <li><b>event-on-change-reading</b> : Sollte mit .* gesetzt sein um nur Änderungen abzupassen, da sehr viele Daten geschickt werden. </li>
-  <li><b>ignoreDatapoints</b>        : Eine Liste von ganzen 1-3 stelligen Zahlen durch Leerzeichen getrennt. Alle in der List enthaltenen Datapoints werden 
+  <li><b>ignoreDatapoints</b>        : Eine Liste von ganzen 1-3 stelligen Zahlen durch Leerzeichen getrennt. Alle in der List enthaltenen Datenpunkte werden 
                                        ignoriert und nicht weiter als Reading verarbeitet.<br>
 								       Bereits bestehende Readings mit dem Eintrag in die Liste werden gelöscht.<br>
 									   Wenn 'ignoreDatapoints' gelöscht wird dauert es eine Weile bis die entsprechenden Datagramme ankommen 
 									   und alle zuvor gelöschten Datenpunkte sind wieder hergestellt. </li>
-  <li><b>timeout</b>                 : Gibt die Zeit in Sekunden an nach dem letzten Empfang eines Datapoints. Wenn diese überschritten wird geht der Status auf 'timeout'.<br>
-                                       Ist z.Z. im Code noch nicht umgesetzt! </li> 
+  <li><b>timeout</b>                 : Gibt die Zeit in Sekunden an nach dem letzten Empfang eines Datenpunkts. Wenn diese überschritten wird geht der Status auf 'timeout'. </li> 
 
   <br><br>
   Achtung:
