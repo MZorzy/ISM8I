@@ -1,4 +1,15 @@
-﻿#!/usr/bin/perl
+#!/usr/bin/perl
+
+###########################################################################################
+###########################################################################################
+##  Server Software zum Empangen, Auswerten und Weitergeben von Wolf ISM8i Datenpunkten  ##
+##  Copyright (C) 2017 bei Dr Mugur Dietrich                                             ##
+##  Frei für den privaten und schulischen Einsatz                                        ##
+##  Kommerziellen Einsatz nur nach vorhergehender Genehmigung !                          ##
+##  Support Seite: http://tips-und-mehr.de und das FHEM User Forum                       ##
+##  Mailadresse: m.i.dietrich@gmx.de                                                     ##
+###########################################################################################
+###########################################################################################
 
 use strict;
 use warnings;
@@ -14,34 +25,74 @@ use Math::Round qw(nearest); # apt isntall libmath-round-perl
 
 binmode(STDOUT, ":utf8");
 
-my $ism8i_port = 12004; # Listening Port für das ISM8i Modul. Muss mit dem Port übereinstimmen, welcher im Webinterface des Moduls eingestellt wurde!
-my $verbose = 1; # 0 = nichts, 1 = Telegrammauswertung, 3 = alles 
-my $fw_version = 15; # Die Firmware Version der ISM8i: 1.5 = 15 , 1.4 = 14
-my $script_path = dirname(__FILE__);
-my $geraet_max_length = 0;
-my @datenpunkte;
-my $last_auswertung = "";
-my $igmp_sock;
-my %hash;
 
-print "\n#############################################################\n";
-print "############ Wolf ISM8i Komunikations-Auswertung ############\n";
-print "#############################################################\n\n";
-
-#Prototypen definieren:
-sub loadConfig;
-sub loadDatenpunkte;
-sub writeDatenpunkteToLog;
-sub showDatenpunkte;
-sub add_to_log($);
+## Prototypen definieren: ###################################################
 sub start_IGMPserver;
 sub send_IGMPmessage($);
 sub start_WolfServer;
+sub create_answer($);
+sub create_logdir;
+sub log_msg_data($$);
+sub add_to_log($);
+sub getLoggingTime;
+sub dec2ip($);
+sub ip2dec($);
 sub r_trim;
 sub l_trim;
 sub all_trim;
 sub dbl_trim;
 sub l_r_dbl_trim;
+sub max($$);
+sub min($$);
+sub getFhemFriendly($);
+sub decodeTelegram($);
+sub loadConfig;
+sub loadDatenpunkte;
+sub showDatenpunkte;
+sub writeDatenpunkteToLog;
+sub getDatenpunkt($$);
+sub getCsvResult($$);
+sub pdt_knx_float($);
+sub pdt_long($);
+sub pdt_time($);
+sub pdt_date($);
+
+
+## Globale Variablen: #######################################################
+
+my $script_path = dirname(__FILE__);
+my $verbose = 1; # 0 = nichts, 1 = Telegrammauswertung, 3 = alles 
+my $fw_actualize = time - 1;
+my $geraet_max_length = 0;
+my @datenpunkte;
+my $last_auswertung = "";
+my $igmp_sock;
+my %hash = (
+             ism8i_ip => '?.?.?.?' ,
+             port     => '12004' ,
+             fw       => '1.5' ,
+             mcip     => '239.7.7.77' ,
+             mcport   => '35353' ,
+             dplog    => '0' ,
+             output   => 'fhem' ,
+			);
+
+			
+## Ablauf starten ###########################################################
+			
+# Original Einstellungen sichern
+*OLD_STDOUT = *STDOUT;
+*OLD_STDERR = *STDERR;
+
+# Umleiten von STDOUT, STDERR
+create_logdir(); # Ordner 'log' erzeugen wenn nicht vorhanden.
+open(my $log_fh, '>>', $script_path."/log/wolf_ism8i.log") or die "Could not open/write file 'wolf_ism8i.log' $!";
+*STDOUT = $log_fh;
+*STDERR = $log_fh;
+
+add_to_log("");
+add_to_log("############ Strate Wolf ISM8i Auswertungs-Modul ############");
+
 
 #Subs aufrufen:
 loadConfig();
@@ -52,25 +103,40 @@ writeDatenpunkteToLog();
 
 #showDatenpunkte();
 
-add_to_log("");
-
 start_IGMPserver();
 
 start_WolfServer();
 
+# STDOUT/STDERR wiederherstellen
+close $log_fh;
+*STDOUT = *OLD_STDOUT;
+*STDERR = *OLD_STDERR;
+
+
+## Sub Definitionen #########################################################
 
 sub start_IGMPserver
 # Startet einen Multicast Server
 {
-   use constant DESTINATION => '239.7.7.77:35353';
-   $igmp_sock = IO::Socket::Multicast->new(Proto=>'udp',PeerAddr=>DESTINATION);
+   add_to_log("Creating multicast group server $hash{mcip}:$hash{mcport}:");
+
+   $igmp_sock = IO::Socket::Multicast->new(
+           Proto     => 'udp',
+		   PeerAddr  => "$hash{mcip}:$hash{mcport}",
+           ReusePort => '1',
+   ) or die "ERROR: Cant create socket: $@! ";
+
+   # ACHTUNG: kein $igmp_sock->mcast_add() bei Server!
+   
+   add_to_log("   Creating to multicast group success.");
 }
 
 
 sub send_IGMPmessage($)
 {
-   my $message = $_[0];
-   $igmp_sock->send($message) || die "Couldn't send: $!";
+   my $message = shift;
+   my $ok = $igmp_sock->send($message) or die "Couldn't send to multicast group: $!";
+   if ($ok == 0) { print $ok."\n"; }
 }
 
 
@@ -83,21 +149,22 @@ sub start_WolfServer
    # creating a listening socket
    my $socket = new IO::Socket::INET (
       LocalHost => '0.0.0.0',
-      LocalPort => $ism8i_port,
+      LocalPort => $hash{port},
       Proto => 'tcp',
       Listen => 5,
       Reuse => 1
    );
    die "Cannot create socket $!\n" unless $socket;
-   print("# Server wartet auf ISM8i Verbindung auf Port $ism8i_port\n");
+   add_to_log("Server wartet auf ISM8i Verbindung auf Port $hash{port}:");
  
    # waiting for a new client connection
    my $client_socket = $socket->accept();
  
    # get information about a newly connected client
    my $client_address = $client_socket->peerhost();
+   $hash{ism8i_ip} = $client_address;
    my $client_port = $client_socket->peerport();
-   print("# Verbindung eines ISM8i Moduls von $client_address:$client_port\n\n");
+   add_to_log("   Verbindung eines ISM8i Moduls von $client_address:$client_port");
  
    while(1)
       {
@@ -105,8 +172,8 @@ sub start_WolfServer
        my $rec_data = "";
        $client_socket->recv($rec_data, 4096);
 	   
-       dprint("Daten Empfang (".length($rec_data)." Bytes):\n");
-       dprint(join(" ", unpack("H2" x length($rec_data), $rec_data))."\n");
+       if ($verbose == 3) { add_to_log("Daten Empfang (".length($rec_data)." Bytes):"); }
+       if ($verbose == 3) { add_to_log(join(" ", unpack("H2" x length($rec_data), $rec_data))); }
 	   
 	   my $starter = chr(0x06).chr(0x20).chr(0xf0).chr(0x80);
        my @fields = split(/$starter/, $rec_data);
@@ -124,14 +191,12 @@ sub start_WolfServer
          	 }	 
 		  }
       }
-   dprint("-----------------------------------------------------------------------------------\n");
 
    # notify client that response has been sent
    shutdown($client_socket, 1);
 
    $socket->close();
 }
-
 
 
 sub create_answer($)
@@ -146,7 +211,7 @@ sub create_answer($)
    elsif ($h[10] eq "f0" and $h[11] eq "06")
       {
        my @a = ($h[0],$h[1],$h[2],$h[3],"00","11",$h[6],$h[7],$h[8],$h[9],$h[10],"86",$h[12],$h[13],"00","00","00");
-       dprint("Antwort: ".join(" ", @a)."\n");
+       if ($verbose == 3) { add_to_log("Antwort: ".join(" ", @a)); }
        return pack("H2" x 17, @a);
 	  }
    else
@@ -154,14 +219,43 @@ sub create_answer($)
 	   return "";
 	  }
 }
+
+
+sub create_logdir
+# Erstellt den Ordner für Logs.
+{
+   my $log_ordner = $script_path."/log";
+   if (not (-e "$log_ordner")) {
+      my $ok = mkdir("$log_ordner",0755);
+      if ($ok == 0) { die "Could not create dictionary '$log_ordner' $!"; }
+   }
+}
+
+
+sub log_msg_data($$)
+# Loggt die als Multicast versendeten Daten in ein Logfile.
+{
+   my ($msg,$format) = @_;
+   my $filename = $script_path."/log/wolf_data.log";
+   open(my $fh, '>>:encoding(UTF-8)', $filename) or die "Could not open file '$filename' $!";
    
+   if ($format eq 'fhem') {
+      print $fh getLoggingTime()." $msg\n";
+   } elsif ($format eq 'csv') {
+      print $fh getLoggingTime().";$msg\n";
+   }
+   
+   close $fh;
+}
+
 
 sub add_to_log($)
 #fügt einen Eintrag zur Logdatei hinzu
 {
+   my $msg = shift;
    my $filename = $script_path."/log/wolf_ism8i.log";
    open(my $fh, '>>:encoding(UTF-8)', $filename) or die "Could not open file '$filename' $!";
-   print $fh $_[0]."\n";
+   print $fh getLoggingTime()." $msg\n";
    close $fh;
 }
 
@@ -174,6 +268,14 @@ sub getLoggingTime
     return $nice_timestamp;
 }
 
+
+###############################################################
+# this sub converts a decimal IP to a dotted IP
+sub dec2ip($) { join '.', unpack 'C4', pack 'N', shift; }
+
+###############################################################
+# this sub converts a dotted IP to a decimal IP
+sub ip2dec($) { unpack N => pack CCCC => split /\./ => shift; }
 
 ###############################################################
 ### Whitespace (v.a. CR LF) rechts im String löschen
@@ -209,7 +311,7 @@ sub min($$) { $_[$_[0] > $_[1]]; }
 sub getFhemFriendly($)
 #Ersetzt alle Zeichen so, dass das Ergebnis als FHEM Reading Name taugt.
 {
-my $working_string = $_[0];
+my $working_string = shift;
 my @tbr = ("ö","oe","ä","ae","ü","ue","Ö","Oe","Ä","Ae","Ü","Ue","ß","ss","³","3","²","2","°C","C","%","proz","[[:punct:][:space:][:cntrl:]]","_","___","_","__","_","^_","","_\$","");
 
 for (my $i=0; $i <= scalar(@tbr)-1; $i+=2)
@@ -232,61 +334,63 @@ sub decodeTelegram($)
    my @h = unpack("H2" x $TelegrammLength, $_[0]);
    
    my $hex_result = join(" ", @h);
-   dprint($hex_result."\n");
+   if ($verbose == 3) { add_to_log($hex_result); }
  
    my $FrameSize = hex($h[4].$h[5]);
    my $MainService = hex($h[10]);
    my $SubService = hex($h[11]);
    
-   if ($FrameSize != $TelegrammLength)
-     {
-	  if ($verbose >= 1) { print getLoggingTime." *** ERROR: TelegrammLength/FrameSize missmatch. [".$FrameSize."/".$TelegrammLength."] ***\n"; }
-	 }
-   elsif ($SubService != 0x06)
-     {
-	  if ($verbose >= 1) { print getLoggingTime." *** WARNING: No SetDatapointValue.Req. [".sprintf("%x", $SubService)."] ***\n"; }
-	 }
-   elsif ($MainService == 0xF0 and $SubService == 0x06)
-     {
+   if ($FrameSize != $TelegrammLength) {
+	  if ($verbose >= 1) { add_to_log("*** ERROR: TelegrammLength/FrameSize missmatch. [".$FrameSize."/".$TelegrammLength."] ***"); }
+   } elsif ($SubService != 0x06) {
+	  if ($verbose >= 1) { add_to_log("*** WARNING: No SetDatapointValue.Req. [".sprintf("%x", $SubService)."] ***"); }
+   } elsif ($MainService == 0xF0 and $SubService == 0x06) {
       my $StartDatapoint = hex($h[12].$h[13]);
       my $NumberOfDatapoints = hex($h[14].$h[15]);
 	  my $Position = 0;
 	  
-	  for (my $n=1; $n <= $NumberOfDatapoints; $n++)
-	    {
+	  for (my $n=1; $n <= $NumberOfDatapoints; $n++) {
          my $DP_ID = hex($h[$Position + 16].$h[$Position + 17]);
          my $DP_command = hex($h[$Position + 18]);
          my $DP_length = hex($h[$Position + 19]);
          my $v = "";
+		 my $send_msg = "";
          for (my $i=0; $i <= $DP_length - 1; $i++) { $v .= $h[$Position + 20 + $i]; }
          my $DP_value = hex($v);
 	     my $auswertung =  getLoggingTime.";".getCsvResult($DP_ID, $DP_value);
-		 if ($auswertung ne $last_auswertung)
-		    {
-			 $last_auswertung = $auswertung;
-		     add_to_log($auswertung);
+		 if ($auswertung ne $last_auswertung) {
+			$last_auswertung = $auswertung;
 			 
-			 #Für FHEM Auswertung erstellen und als Multicast wegschicken.
-			 my @fields = split(/;/, $auswertung);
-			 # 1. Geraet - 2. DP ID - 3. Datenpunkt - optional 4. Einheit
-	         my $fhem_msg = getFhemFriendly($fields[2]).".".$fields[1].".".getFhemFriendly($fields[3]);
-			 ## 1. DP ID - 2. Geraet - 3. Datenpunkt - optional 4. Einheit
-	         #my $fhem_msg = $fields[1].".".getFhemFriendly($fields[2]).".".getFhemFriendly($fields[3]);
-			 if (scalar(@fields) == 6) { $fhem_msg .= ".".getFhemFriendly($fields[5]); }
-			 $fhem_msg .= " ".$fields[4];
-			 send_IGMPmessage($fhem_msg);
-			     
-             if ($verbose >= 1)
-      	        {
-		         my $pr = $fields[0]." [".(" "x(3-length($fields[1]))).$fields[1]."] ".$fields[2]." ---".("-"x($geraet_max_length-length($fields[2])))."> ".$fields[3].": ".$fields[4];
-	             if (scalar(@fields) == 6) { $pr .= " ".$fields[5]; }
- 		         print $pr."\n";
-	            }
+			my @fields = split(/;/, $auswertung); # [0]=Timestamp, [1]=DP ID, [2]=Geraet, [3]=Datenpunkt, [4]=Wert, optional [5]=Einheit
+			 
+			if ($hash{output} eq 'fhem') {
+			   ## Auswertung für FHEM erstellen ##
+	           $send_msg = getFhemFriendly($fields[2]).".".$fields[1].".".getFhemFriendly($fields[3]); # Geraet - DP ID - Datenpunkt
+			   if (scalar(@fields) == 6) { $send_msg .= ".".getFhemFriendly($fields[5]); } # Einheit (wenn vorhanden)
+			   $send_msg .= " ".$fields[4]; # Wert (nach Leerstelle!)
+			} elsif ($hash{output} eq 'csv') {
+			   ## Auswertung als CSV erstellen ##
+	           $send_msg = $fields[1].";".$fields[2].";".$fields[3].";".$fields[4];
+			   if (scalar(@fields) == 6) { $send_msg .= ";".$fields[5]; }
 			}
-		 $Position += 4 + $DP_length;
-		}
-	 }
 
+			## Auswertung an Multicast Gruppe schicken ..
+			send_IGMPmessage($send_msg);
+			
+			## Wenn aktiviert, Auswertung in ein File schreiben ##
+			if ($hash{dplog} eq '1') { log_msg_data($send_msg,$hash{output}); }
+			 
+			## Wolf ISMi basierte Werte alle 60 Minuten schicken ##
+			if (time >= $fw_actualize and $hash{output} eq 'fhem') { 
+			   send_IGMPmessage("ISM8i.997.IP $hash{ism8i_ip}");
+			   send_IGMPmessage("ISM8i.998.Port $hash{port}");
+			   send_IGMPmessage("ISM8i.999.Firmware $hash{fw}");
+			   $fw_actualize = time + 3600;
+			}	
+		 }
+		 $Position += 4 + $DP_length;
+	  }
+   }
 }
 
 
@@ -300,94 +404,102 @@ sub loadConfig
 #                ist die IP des PCs/Raspis auf dem dieses Modul läuft.
 #                Default ist 12004.
 #   fw_version = Die Firmware Version des Wolf ISM8i Schnittstellenmoduls. Diese steht im Webinterface des Schnittstellenmoduls.
-#                Möglich sind 1.4 oder 1.5
-#                Default ist 1.5
+#                Möglich sind 1.4 oder 1.5.
+#                Default ist 1.5.
 #   multicast_ip = die IPv4 Adresse der Multicast Gruppe an der die die entschlüsselten Datagramme geschickt werden. Default ist 
 #                  Bitte beim Ändern auf die Vorgaben für Multicast Adressen achten!
 #                  Default ist 239.7.7.77.
 #   multicast_port = Der Port der Multicast Gruppe. Möglich von 1 bis 65535.
 #                    Default ist 35353.
-#   dplog = Gibt an ob die empfangenen Datenpunkte als Log ausgegeben werden sollnen.
-#           Wenn geloggt wird bitte in regelmäßigen Abständen die Größe des Logfiles prüfen und ggf. löschen, dader Log schnell sehr groß werden kann.
-#           Default ist 0.
+#   dp_log = Gibt an ob die empfangenen Datenpunkte als Log ausgegeben werden sollnen.
+#            Wenn geloggt wird bitte in regelmäßigen Abständen die Größe des Logfiles prüfen und ggf. löschen, dader Log schnell sehr groß werden kann.
+#            Möglich sind 0 oder 1.
+#            Default ist 0.
 #   output = Das Format in welchem die Datenpunkte an die Multicast Gruppe oder an das Datenpunkte-Log gesickt wird. 
 #            Möglich ist 'csv' für das CSV Format (mit Semikolon (;) separiert) z.B. zum Importieren in Tabekkenkalkulationen. 
 #            Möglich ist 'fhem' als Spezialformat für das ISM8I Modul.
-#            Default ist 'fhem'
+#            Default ist 'fhem'.
 #
 {
-   my $rw = "";
    my $file = $script_path."/wolf_ism8i.conf";
-   if (-e $filename)
-     {
-      open(my $data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
-	  
+   add_to_log("Reading Config:");
+   if (-e $file) {
+	  my $data;
+      open($data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
+      add_to_log("   Config file '$file' found and opened for reading.");
       while (my $line = <$data>) {
 	    $line = lc($line); # alles lowe case
-        my @fields = split(/ /, l_r_dbl_trim($line));
-	    if (scalar(@fields) == 2) {
-	       if ($fields[0] eq "ism8i_port") { 
-		      if ($fields[1] =~ m/^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$/ and $fields[1] > 0 and $fields[1] <= 65535) {
-			     $hash->{port} = $fields[1]; } else { $hash->{port} = '12004'; }
-		   } elsif ($fields[0] eq "fw_version") {
-		      if ($fields[1] =~ m/^\d{1}\.\d{1}$/) {
-		      $hash->{fw} = $fields[1]; } else { $hash->{fw} = '1.5'; }
-			  if ($hash->{fw} ne '1.4') { $hash->{fw} = '1.5'; }
-		   } elsif ($fields[0] eq "multicast_ip") {
-		      if ($fields[1] =~ m/^(?:(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])$/) {
-		      $hash->{mcip} = $fields[1]; } else { $hash->{mcip} = '239.7.7.77'; }
-		   } elsif ($fields[0] eq "multicast_port") {
-		      if ($fields[1] =~ m/^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$/ and $fields[1] > 0 and $fields[1] <= 65535) {
-			     $hash->{mcport} = $fields[1]; } else { $hash->{mcport} = '35353'; }
-		   } elsif ($fields[0] eq "dp_log") {
-		      if ($fields[1] =~ m/^(1|0)$/) {
-		      $hash->{dplog} = $fields[1]; } else { $hash->{dplog} = '0'; }
-		   } elsif ($fields[0] eq "output") {
-		      if ($fields[1] =~ m/^(csv|fhem)$/) {
-		      $hash->{output} = $fields[1]; } else { $hash->{dplog} = 'fhem'; }
-	       }
+		if ($line !~ m/#/) {
+		   my @fields = split(/ /, l_r_dbl_trim($line));
+	       if (scalar(@fields) == 2) {
+              add_to_log("      $fields[0] -> $fields[1]");
+	          if ($fields[0] eq "ism8i_port") { 
+		         if ($fields[1] =~ m/^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$/ and $fields[1] > 0 and $fields[1] <= 65535) {
+			        $hash{port} = $fields[1]; } else { $hash{port} = '12004'; }
+		      } elsif ($fields[0] eq "fw_version") {
+		         if ($fields[1] =~ m/^\d{1}\.\d{1}$/) {
+		         $hash{fw} = $fields[1]; } else { $hash{fw} = '1.5'; }
+			     if ($hash{fw} ne '1.4') { $hash{fw} = '1.5'; }
+		      } elsif ($fields[0] eq "multicast_ip") {
+     		     if ($fields[1] =~ m/^(?:(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])$/) {
+		         $hash{mcip} = $fields[1]; } else { $hash{mcip} = '239.7.7.77'; }
+		      } elsif ($fields[0] eq "multicast_port") {
+		         if ($fields[1] =~ m/^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$/ and $fields[1] > 0 and $fields[1] <= 65535) {
+			        $hash{mcport} = $fields[1]; } else { $hash{mcport} = '35353'; }
+		      } elsif ($fields[0] eq "dp_log") {
+		         if ($fields[1] =~ m/^(1|0)$/) {
+		            $hash{dplog} = $fields[1]; } else { $hash{dplog} = '0'; }
+		      } elsif ($fields[0] eq "output") {
+		         if ($fields[1] =~ m/^(csv|fhem)$/) {
+		            $hash{output} = $fields[1]; } else { $hash{dplog} = 'fhem'; }
+	          }
+		   }	  
 	    }
       }
-    } else {
-      open(my $fh, '>:encoding(UTF-8)', $file) or die "Could not open/write file '$filename' $!";
+	  close $data;
+   } else {
+     add_to_log("   Config file not found, creating new config file.");
+     open(my $fh, '>:encoding(UTF-8)', $file) or die "Could not open/write file '$file' $!";
 	  
-      print $fh "######################################################################################################################################################\n";
-      print $fh "#Config Datei laden und Werte zwischenspeichern. Wenn keine Config Datei vorhanden ist wird eine angelegt.\n";
-      print $fh "#Wenn die Werte in der Config nicht den Vorgaben entsprechen, dann werden die Standardwerte genommen.\n";
-      print $fh "######################################################################################################################################################\n";
-      print $fh "#Bedeutung der Einträge der Config:\n";
-      print $fh "#\n";
-      print $fh "#   ism8i_port = Port auf dem das Modul auf den TCP Trafic des Wolf ISM8i Schnittstellenmoduls hört.\n";
-      print $fh "#                Die IP und der Port wird im Webinterface des Schnittstellenmoduls eingestellt. Die IP\n";
-      print $fh "#                ist die IP des PCs/Raspis auf dem dieses Modul läuft.\n";
-      print $fh "#                Default ist 12004.\n";
-      print $fh "#   fw_version = Die Firmware Version des Wolf ISM8i Schnittstellenmoduls. Diese steht im Webinterface des Schnittstellenmoduls.\n";
-      print $fh "#                Möglich sind 1.4 oder 1.5\n";
-      print $fh "#                Default ist 1.5\n";
-      print $fh "#   multicast_ip = die IPv4 Adresse der Multicast Gruppe an der die die entschlüsselten Datagramme geschickt werden. Default ist\n";
-      print $fh "#                  Bitte beim Ändern auf die Vorgaben für Multicast Adressen achten!\n";
-      print $fh "#                  Default ist 239.7.7.77.\n";
-      print $fh "#   multicast_port = Der Port der Multicast Gruppe. Möglich von 1 bis 65535.\n";
-      print $fh "#                    Default ist 35353.\n";
-      print $fh "#   dplog = Gibt an ob die empfangenen Datenpunkte als Log ausgegeben werden sollnen.\n";
-      print $fh "#           Wenn geloggt wird bitte in regelmäßigen Abständen die Größe des Logfiles prüfen und ggf. löschen, dader Log schnell sehr groß werden kann.\n";
-      print $fh "#           Default ist 0.\n";
-      print $fh "#   output = Das Format in welchem die Datenpunkte an die Multicast Gruppe oder an das Datenpunkte-Log gesickt wird.\n";
-      print $fh "#            Möglich ist 'csv' für das CSV Format (mit Semikolon (;) separiert) z.B. zum Importieren in Tabekkenkalkulationen.\n";
-      print $fh "#            Möglich ist 'fhem' als Spezialformat für das ISM8I Modul.\n";
-      print $fh "#            Default ist 'fhem'\n";
-      print $fh "######################################################################################################################################################\n";
-      print $fh "\n";
-	  
-	  print $fh "ism8i_port $hash->{port}\n";
-	  print $fh "fw_version $hash->{fw}\n";
-	  print $fh "multicast_ip $hash->{mcip}\n";
-	  print $fh "multicast_port $hash->{mcport}\n";
-	  print $fh "dplog $hash->{dplog}\n";
-	  print $fh "output $hash->{output}\n";
+     print $fh "######################################################################################################################################################\n";
+     print $fh "#Config Datei laden und Werte zwischenspeichern. Wenn keine Config Datei vorhanden ist wird eine angelegt.\n";
+     print $fh "#Wenn die Werte in der Config nicht den Vorgaben entsprechen, dann werden die Standardwerte genommen.\n";
+     print $fh "######################################################################################################################################################\n";
+     print $fh "#Bedeutung der Einträge der Config:\n";
+     print $fh "#\n";
+     print $fh "#   ism8i_port = Port auf dem das Modul auf den TCP Trafic des Wolf ISM8i Schnittstellenmoduls hört.\n";
+     print $fh "#                Die IP und der Port wird im Webinterface des Schnittstellenmoduls eingestellt. Die IP\n";
+     print $fh "#                ist die IP des PCs/Raspis auf dem dieses Modul läuft.\n";
+     print $fh "#                Default ist 12004.\n";
+     print $fh "#   fw_version = Die Firmware Version des Wolf ISM8i Schnittstellenmoduls. Diese steht im Webinterface des Schnittstellenmoduls.\n";
+     print $fh "#                Möglich sind 1.4 oder 1.5\n";
+     print $fh "#                Default ist 1.5\n";
+     print $fh "#   multicast_ip = die IPv4 Adresse der Multicast Gruppe an der die die entschlüsselten Datagramme geschickt werden. Default ist\n";
+     print $fh "#                  Bitte beim Ändern auf die Vorgaben für Multicast Adressen achten!\n";
+     print $fh "#                  Default ist 239.7.7.77.\n";
+     print $fh "#   multicast_port = Der Port der Multicast Gruppe. Möglich von 1 bis 65535.\n";
+     print $fh "#                    Default ist 35353.\n";
+     print $fh "#   dp_log = Gibt an ob die empfangenen Datenpunkte als Log ausgegeben werden sollnen.\n";
+     print $fh "#            Wenn geloggt wird bitte in regelmäßigen Abständen die Größe des Logfiles prüfen und ggf. löschen, dader Log schnell sehr groß werden kann.\n";
+     print $fh "#            Möglich sind 0 oder 1.\n";
+     print $fh "#            Default ist 0.\n";
+     print $fh "#   output = Das Format in welchem die Datenpunkte an die Multicast Gruppe oder an das Datenpunkte-Log gesickt wird.\n";
+     print $fh "#            Möglich ist 'csv' für das CSV Format (mit Semikolon (;) separiert) z.B. zum Importieren in Tabekkenkalkulationen.\n";
+     print $fh "#            Möglich ist 'fhem' als Spezialformat für das ISM8I Modul.\n";
+     print $fh "#            Default ist 'fhem'\n";
+     print $fh "######################################################################################################################################################\n\n";
+	 
+	 print $fh "ism8i_port $hash{port}\n";
+	 print $fh "fw_version $hash{fw}\n";
+	 print $fh "multicast_ip $hash{mcip}\n";
+	 print $fh "multicast_port $hash{mcport}\n";
+	 print $fh "dp_log $hash{dplog}\n";
+	 print $fh "output $hash{output}\n";
 
-      close $fh;
-	}
+     close $fh;
+   }
+	
+   add_to_log("      [$hash{port}] [$hash{fw}] [$hash{mcip}] [$hash{mcport}] [$hash{dplog}] [$hash{output}]");
 }
 
 
@@ -399,19 +511,21 @@ sub loadDatenpunkte
    #erstmal vorsichtshalber datenpunkte array löschen:
    while(@datenpunkte) { shift(@datenpunkte); }
    
+   my $fw_version = $hash{fw};
+   $fw_version =~ s/\.//g;
    my $file = $script_path."/wolf_datenpunkte_".$fw_version.".csv";
-
-   open(my $data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
-
+   my $data;
+   open($data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
    while (my $line = <$data>)
     {
      my @fields = split(/;/, r_trim($line));
 	 if (scalar(@fields) == 6)
 	   {
-	    $datenpunkte[0 + $fields[0]] = [ @fields ]; #so hinzufügen, damit der Index mit der DP ID übereinstimmt zu einfacheren Suche.
+	    $datenpunkte[0 + $fields[0]] = [ @fields ]; # <-so hinzufügen, damit der Index mit der DP ID übereinstimmt zu einfacheren Suche.
 		$geraet_max_length = max($geraet_max_length, length($fields[1]));
 	   }
     }
+	close $data;
 }
 
 
@@ -419,12 +533,10 @@ sub showDatenpunkte
 #Devloper Sub zur Kontrolle des eingelesenen CSV Files
 {
    print "\n";
-   
-   foreach my $o (@datenpunkte)
-     {
+   foreach my $o (@datenpunkte) {
 	  foreach my $i (@$o) { print $i."  "; }
 	  print "\n";
-	 }
+   }
 }
 
 
@@ -532,7 +644,7 @@ sub getCsvResult($$)
    elsif ($datatype eq "DPT_HVACMode") 
      {
 	  my @Heizkreis = ("Standby","Automatikbetrieb","Heizbetrieb","Sparbetrieb");
-	  my @CWL = ("Automatikbetrieb","Reduzierung Lüftung","Nennlüftung");
+	  my @CWL = ("-","Automatikbetrieb","Reduzierung Lüftung","Nennlüftung");
 	 
       if ($geraet =~ /Heizkreis/ or $geraet =~ /Mischerkreis/)
 	   	{ $v = $Heizkreis[$dp_val]; }
@@ -654,9 +766,4 @@ sub getBitweise($$$)
    return $result;
 }
 
-
-sub dprint($)
-#Printet die übergebene Variable nur wenn debuged wird.
-{
-   if ($verbose == 2) { print ($_[0]); }
-}
+exit 0;
