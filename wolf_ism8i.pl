@@ -1,5 +1,16 @@
 #!/usr/bin/perl
 
+###########################################################################################
+###########################################################################################
+##  Server Software zum Empangen, Auswerten und Weitergeben von Wolf ISM8i Datenpunkten  ##
+##  Copyright (C) 2017 bei Dr Mugur Dietrich                                             ##
+##  Frei für den privaten und schulischen Einsatz                                        ##
+##  Kommerziellen Einsatz nur nach vorhergehender Genehmigung !                          ##
+##  Support Seite: http://tips-und-mehr.de und das FHEM User Forum                       ##
+##  Mailadresse: m.i.dietrich@gmx.de                                                     ##
+###########################################################################################
+###########################################################################################
+
 use strict;
 use warnings;
 use utf8;
@@ -14,17 +25,16 @@ use Math::Round qw(nearest); # apt isntall libmath-round-perl
 
 binmode(STDOUT, ":utf8");
 
-# Prototypen definieren: ##################################################
-sub create_logdir;
-sub loadConfig;
-sub loadDatenpunkte;
-sub writeDatenpunkteToLog;
-sub showDatenpunkte;
-sub add_to_log($);
-sub log_msg_data($$);
+
+## Prototypen definieren: ###################################################
 sub start_IGMPserver;
 sub send_IGMPmessage($);
 sub start_WolfServer;
+sub create_answer($);
+sub create_logdir;
+sub log_msg_data($$);
+sub add_to_log($);
+sub getLoggingTime;
 sub dec2ip($);
 sub ip2dec($);
 sub r_trim;
@@ -32,8 +42,24 @@ sub l_trim;
 sub all_trim;
 sub dbl_trim;
 sub l_r_dbl_trim;
+sub max($$);
+sub min($$);
+sub getFhemFriendly($);
+sub decodeTelegram($);
+sub loadConfig;
+sub loadDatenpunkte;
+sub showDatenpunkte;
+sub writeDatenpunkteToLog;
+sub getDatenpunkt($$);
+sub getCsvResult($$);
+sub pdt_knx_float($);
+sub pdt_long($);
+sub pdt_time($);
+sub pdt_date($);
 
-# Globale Variablen: #######################################################
+
+## Globale Variablen: #######################################################
+
 my $script_path = dirname(__FILE__);
 my $verbose = 1; # 0 = nichts, 1 = Telegrammauswertung, 3 = alles 
 my $fw_actualize = time - 1;
@@ -51,6 +77,9 @@ my %hash = (
              output   => 'fhem' ,
 			);
 
+			
+## Ablauf starten ###########################################################
+			
 # Original Einstellungen sichern
 *OLD_STDOUT = *STDOUT;
 *OLD_STDERR = *STDERR;
@@ -79,10 +108,12 @@ start_IGMPserver();
 start_WolfServer();
 
 # STDOUT/STDERR wiederherstellen
+close $log_fh;
 *STDOUT = *OLD_STDOUT;
 *STDERR = *OLD_STDERR;
 
-#################### Sub Definitionen #####################################################################################
+
+## Sub Definitionen #########################################################
 
 sub start_IGMPserver
 # Startet einen Multicast Server
@@ -141,8 +172,8 @@ sub start_WolfServer
        my $rec_data = "";
        $client_socket->recv($rec_data, 4096);
 	   
-       dprint("Daten Empfang (".length($rec_data)." Bytes):\n");
-       dprint(join(" ", unpack("H2" x length($rec_data), $rec_data))."\n");
+       if ($verbose == 3) { add_to_log("Daten Empfang (".length($rec_data)." Bytes):"); }
+       if ($verbose == 3) { add_to_log(join(" ", unpack("H2" x length($rec_data), $rec_data))); }
 	   
 	   my $starter = chr(0x06).chr(0x20).chr(0xf0).chr(0x80);
        my @fields = split(/$starter/, $rec_data);
@@ -160,7 +191,6 @@ sub start_WolfServer
          	 }	 
 		  }
       }
-   dprint("-----------------------------------------------------------------------------------\n");
 
    # notify client that response has been sent
    shutdown($client_socket, 1);
@@ -181,7 +211,7 @@ sub create_answer($)
    elsif ($h[10] eq "f0" and $h[11] eq "06")
       {
        my @a = ($h[0],$h[1],$h[2],$h[3],"00","11",$h[6],$h[7],$h[8],$h[9],$h[10],"86",$h[12],$h[13],"00","00","00");
-       dprint("Antwort: ".join(" ", @a)."\n");
+       if ($verbose == 3) { add_to_log("Antwort: ".join(" ", @a)); }
        return pack("H2" x 17, @a);
 	  }
    else
@@ -304,7 +334,7 @@ sub decodeTelegram($)
    my @h = unpack("H2" x $TelegrammLength, $_[0]);
    
    my $hex_result = join(" ", @h);
-   dprint($hex_result."\n");
+   if ($verbose == 3) { add_to_log($hex_result); }
  
    my $FrameSize = hex($h[4].$h[5]);
    my $MainService = hex($h[10]);
@@ -394,7 +424,8 @@ sub loadConfig
    my $file = $script_path."/wolf_ism8i.conf";
    add_to_log("Reading Config:");
    if (-e $file) {
-      open(my $data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
+	  my $data;
+      open($data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
       add_to_log("   Config file '$file' found and opened for reading.");
       while (my $line = <$data>) {
 	    $line = lc($line); # alles lowe case
@@ -425,6 +456,7 @@ sub loadConfig
 		   }	  
 	    }
       }
+	  close $data;
    } else {
      add_to_log("   Config file not found, creating new config file.");
      open(my $fh, '>:encoding(UTF-8)', $file) or die "Could not open/write file '$file' $!";
@@ -482,9 +514,8 @@ sub loadDatenpunkte
    my $fw_version = $hash{fw};
    $fw_version =~ s/\.//g;
    my $file = $script_path."/wolf_datenpunkte_".$fw_version.".csv";
-
-   open(my $data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
-
+   my $data;
+   open($data, '<:encoding(UTF-8)', $file) or die "Could not open '$file' $!\n";
    while (my $line = <$data>)
     {
      my @fields = split(/;/, r_trim($line));
@@ -494,6 +525,7 @@ sub loadDatenpunkte
 		$geraet_max_length = max($geraet_max_length, length($fields[1]));
 	   }
     }
+	close $data;
 }
 
 
@@ -612,7 +644,7 @@ sub getCsvResult($$)
    elsif ($datatype eq "DPT_HVACMode") 
      {
 	  my @Heizkreis = ("Standby","Automatikbetrieb","Heizbetrieb","Sparbetrieb");
-	  my @CWL = ("Automatikbetrieb","Reduzierung Lüftung","Nennlüftung");
+	  my @CWL = ("-","Automatikbetrieb","Reduzierung Lüftung","Nennlüftung");
 	 
       if ($geraet =~ /Heizkreis/ or $geraet =~ /Mischerkreis/)
 	   	{ $v = $Heizkreis[$dp_val]; }
@@ -734,9 +766,4 @@ sub getBitweise($$$)
    return $result;
 }
 
-
-sub dprint($)
-#Printet die übergebene Variable nur wenn debuged wird.
-{
-   if ($verbose == 2) { print ($_[0]); }
-}
+exit 0;

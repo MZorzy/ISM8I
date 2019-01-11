@@ -1,0 +1,59 @@
+#!/bin/sh
+#
+### BEGIN INIT INFO
+# Provides:          wolf_ism8i.pl
+# Required-Start:    $all
+# Required-Stop:     $all
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Wolf ISM8i Server
+# Description:       Provides a TCP server for ISM8i input and a Multicast server for result output.
+### END INIT INFO
+
+# Author: Dr. Mugur Dietrich <m.i.dietrich@gmx.de>
+
+set -e
+cd /opt/wolf
+
+do_status () {
+    cnt=`ps -ef | grep "wolf_ism8i.pl" | grep -v grep | wc -l`
+    if [ "$cnt" -eq "0" ] ; then
+        echo "Wolf ISM8i server is NOT running!"
+    else
+        echo "Wolf ISM8i server is running."
+    fi
+}
+
+# Carry out specific functions when asked to by the system
+case "$1" in
+  'start')
+    echo "Starting Wolf ISM8i server..."
+    perl /opt/wolf/wolf_ism8i.pl &
+    RETVAL=$?
+	do_status
+    ;;
+  'stop')
+    echo "Stopping Wolf ISM8i server..."
+    pkill -f wolf_ism8i.pl
+    RETVAL=$?
+	do_status
+    ;;
+  'restart')
+    echo "Restarting Wolf ISM8i server..."
+    pkill -f wolf_ism8i.pl
+    RETVAL=$?
+	sleep 1
+    perl /opt/wolf/wolf_ism8i.pl &
+    RETVAL=$?
+	do_status
+    ;;
+  'status')
+	do_status
+    ;;
+  *)
+    echo "Usage: /etc/init.d/wolfserver {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+
+exit $RETVAL
